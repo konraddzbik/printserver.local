@@ -44,12 +44,12 @@ With **Claude Code**, from a clone of this repo on your Mac:
 /provision-printserver pi@printserver.local
 ```
 
-The skill delegates to two subagents:
+The skill orchestrates two subagents. Only the skill declares DONE, after you confirm a page printed from your phone:
 
 | Subagent | Role | Can change the Pi? |
 |---|---|---|
-| [`printserver-provisioner`](.claude/agents/printserver-provisioner.md) | Recon → configure → `setup.sh` | ✅ (asks before risky actions) |
-| [`printserver-verifier`](.claude/agents/printserver-verifier.md) | Runs `verify.sh` and gives a DONE / NOT DONE verdict | ❌ read-only by design |
+| [`printserver-provisioner`](.claude/agents/printserver-provisioner.md) | Recon → configure → `setup.sh` | ✅ (risky commands and script changes are returned for your approval first) |
+| [`printserver-verifier`](.claude/agents/printserver-verifier.md) | Runs `verify.sh` once and reports `AUTOMATED: PASS / FAIL` | ❌ read-only, enforced by a [hook](.claude/hooks/verifier-readonly.sh) |
 
 With **any other agent**, tell it: *"Follow AGENTS.md to provision the print server at pi@printserver.local."*
 
@@ -58,10 +58,12 @@ With **any other agent**, tell it: *"Follow AGENTS.md to provision the print ser
 On the Pi:
 
 ```bash
+sudo apt install -y git                                    # Pi OS Lite doesn't ship git
 git clone https://github.com/konraddzbik/printserver.local.git && cd printserver.local
-cp config/printserver.env.example config/printserver.env   # optional: tweak name, driver, paper size
-sudo ./scripts/setup.sh --dry-run                          # preview
-sudo ./scripts/setup.sh                                    # idempotent, safe to re-run
+cp config/printserver.env.example config/printserver.env   # optional: uncomment what you change
+chmod 600 config/printserver.env
+sudo ./scripts/setup.sh --dry-run                          # preview, changes nothing
+sudo ./scripts/setup.sh                                    # converges; re-runs only change what differs
 ./scripts/verify.sh                                        # executable Definition of Done
 ```
 
@@ -69,16 +71,18 @@ sudo ./scripts/setup.sh                                    # idempotent, safe to
 <img src="assets/verify.gif" alt="Terminal running ./scripts/verify.sh, showing ten Definition of Done checks passing" width="760">
 </div>
 
-`verify.sh --json` emits machine-readable results for agents and CI. Set `PRINT_TEST_PAGE=1` to add a real test print (DOD-11).
+`verify.sh --json` emits machine-readable results for agents and CI. `PRINT_TEST_PAGE=1 ./scripts/verify.sh` adds a real test print (DOD-11). It's deliberately not settable from the config file.
+
+Secure by default: CUPS is reachable from the local network only (`NETWORK_ACCESS=local`), and the admin pages stay on the Pi (`REMOTE_ADMIN=no`). AirPrint needs neither. An existing queue keeps its driver options on re-runs unless you pass `--force`.
 
 ### ✅ Definition of Done
 
 | | Check |
 |---|---|
 | DOD-1…2 | `cups` and `avahi-daemon` active |
-| DOD-3…4 | CUPS listens on the LAN, web UI answers on `:631` |
+| DOD-3…4 | CUPS listens on the LAN, web UI enabled on `:631` |
 | DOD-5…8 | Queue enabled, accepting, **shared**, default |
-| DOD-9…10 | Advertised over Bonjour with an AirPrint (`URF=`) TXT record |
+| DOD-9…10 | **This Pi** advertises the queue over Bonjour with an AirPrint (`URF=`) TXT record |
 | DOD-11 | *(opt-in)* Test page completes |
 | DOD-M1…M3 | DHCP reservation · prints from an Apple device · no secrets committed |
 
@@ -147,7 +151,7 @@ sudo usermod -aG lpadmin $USER
 CUPS ships locked to localhost. Enable everything in **one** command — separate `cupsctl` invocations can silently reset earlier flags (I learned this the fun way when the web UI reported *"The web interface is currently disabled"*):
 
 ```bash
-sudo cupsctl --remote-any --remote-admin --share-printers WebInterface=yes
+sudo cupsctl --no-remote-any --remote-admin --share-printers WebInterface=yes
 sudo systemctl restart cups
 ```
 
@@ -159,7 +163,7 @@ sudo ss -tlnp | grep 631
 
 You want `*:631` or `0.0.0.0:631`. If you only see `127.0.0.1:631`, the config didn't take.
 
-> **Security note:** `--remote-any` allows access from any network the Pi can see. On a home LAN behind NAT that's fine. On anything shared, restrict access in `/etc/cups/cupsd.conf` with `Allow @LOCAL` instead.
+> **Security note:** `--no-remote-any` keeps CUPS to the local subnet (`Allow @LOCAL`). `--remote-any` would open it to any network the Pi can see, including over a global IPv6 address, so NAT alone doesn't protect you. `--remote-admin` is only here so you can add the printer from your Mac's browser in step 4. Once that's done, turn it off with `sudo cupsctl --no-remote-admin --no-remote-any --share-printers WebInterface=yes` (the scripts never enable it unless you set `REMOTE_ADMIN=yes`).
 
 ## 4. Add the printer
 
@@ -225,8 +229,8 @@ Then grab your iPhone → any app → Share → Print. The printer appears withi
 ## Optional hardening & maintenance
 
 ```bash
-# Keep the queue from silently accumulating dead jobs
-sudo cupsctl PreserveJobHistory=no
+# Keep job history bounded (1 h) instead of piling up; 'no' would break verify.sh DOD-11
+sudo cupsctl PreserveJobHistory=3600
 
 # Unattended security updates
 sudo apt install unattended-upgrades
@@ -242,20 +246,23 @@ CUPS logs live in `/var/log/cups/error_log` — bump `LogLevel debug` in `cupsd.
 ├── CLAUDE.md                  # Claude Code entry point → imports AGENTS.md
 ├── .claude/
 │   ├── agents/                # printserver-provisioner, printserver-verifier
+│   ├── hooks/                 # verifier-readonly.sh (enforces read-only verifier)
 │   └── skills/provision-printserver/   # /provision-printserver
 ├── config/printserver.env.example
 ├── docs/DEFINITION_OF_DONE.md
 ├── scripts/
-│   ├── setup.sh               # idempotent provisioning (--dry-run)
-│   └── verify.sh              # executable DoD (--json)
+│   ├── lib.sh                 # shared, validated config loader
+│   ├── setup.sh               # converging provisioning (--dry-run, --force)
+│   ├── verify.sh              # executable DoD (--json), source of truth for the checks
+│   └── check-dod-sync.sh      # CI: verify.sh ⇄ DEFINITION_OF_DONE.md
 └── assets/                    # README GIFs; regenerate: python3 assets/src/make_gifs.py
 ```
 
-> The scripts default to `NETWORK_ACCESS=local` (`Allow @LOCAL`), which is stricter than the `--remote-any` used in the manual §3. Set `NETWORK_ACCESS=any` in `config/printserver.env` to match the manual.
+> The scripts and the manual share the same network default (`Allow @LOCAL`). The scripts also keep remote admin off. Opt in with `REMOTE_ADMIN=yes` in `config/printserver.env`.
 
 ## Contributing
 
-PRs welcome. Keep scripts `shellcheck`-clean and idempotent. If you add a check, update `verify.sh`, `docs/DEFINITION_OF_DONE.md`, and the troubleshooting table together. See [`AGENTS.md` → Changing this repo](AGENTS.md#changing-this-repo).
+PRs welcome. Keep scripts `shellcheck`-clean and convergent (re-runs change nothing). If you add a check, add it to `verify.sh` and `docs/DEFINITION_OF_DONE.md` (CI enforces the match), update the DoD summary above, then regenerate the GIFs. See [`AGENTS.md` → Changing this repo](AGENTS.md#changing-this-repo).
 
 ## License
 

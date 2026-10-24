@@ -5,12 +5,23 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  shellcheck:
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: shellcheck
-        run: shellcheck scripts/*.sh
+        run: |
+          shellcheck --version
+          shellcheck -x scripts/*.sh .claude/hooks/*.sh tests/*.sh
       - name: bash syntax
-        run: bash -n scripts/*.sh
+        run: for f in scripts/*.sh .claude/hooks/*.sh tests/*.sh; do bash -n "$f"; done
+      - name: tests
+        run: tests/run.sh
+      - name: Definition of Done in sync
+        run: ./scripts/check-dod-sync.sh

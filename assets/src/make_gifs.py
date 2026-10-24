@@ -1,4 +1,5 @@
-"""Render the README GIFs. Usage: python3 assets/src/make_gifs.py  (requires Pillow)."""
+"""Render the README GIFs. Usage: pip install -r assets/src/requirements.txt && python3 assets/src/make_gifs.py"""
+import re
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -134,7 +135,7 @@ def workflow():
             if i < 5:
                 d.text((x0 + cw + gap / 2, top + 75), "›", font=font(20), fill=GREEN if done else LINE, anchor="mm")
         if current >= len(PHASES):
-            d.text((W / 2, 370), "VERDICT: DONE   10/10 automated · client confirmed", font=font(18, True),
+            d.text((W / 2, 370), f"VERDICT: DONE   {len(CHECKS)}/{len(CHECKS)} automated · client confirmed", font=font(18, True),
                    fill=GREEN, anchor="mm")
         elif step % 3 == 2:
             d.text((W / 2, 370), f"gate {PHASES[current][0]} passed ✓", font=font(16, True), fill=GREEN, anchor="mm")
@@ -148,18 +149,13 @@ def workflow():
 
 
 # 3. verify.sh in a terminal --------------------------------------------------
-CHECKS = [
-    ("DOD-1", "cups service active"),
-    ("DOD-2", "avahi-daemon service active"),
-    ("DOD-3", "CUPS listens on the LAN (:631)"),
-    ("DOD-4", "web UI answers on https://:631"),
-    ("DOD-5", "queue exists and is enabled"),
-    ("DOD-6", "queue accepts jobs"),
-    ("DOD-7", "queue is shared"),
-    ("DOD-8", "queue is the system default"),
-    ("DOD-9", "advertised via Bonjour (_ipp._tcp)"),
-    ("DOD-10", "AirPrint TXT record (URF) present"),
-]
+def load_checks():
+    """Read the always-on checks from scripts/verify.sh, the source of truth."""
+    src = (OUT.parent / "scripts" / "verify.sh").read_text()
+    return re.findall(r'^check (DOD-\d+) "([^"]+)"', src, flags=re.M)
+
+
+CHECKS = load_checks()
 
 
 def terminal():
@@ -188,7 +184,7 @@ def terminal():
             d.text((72, y), f"{cid:<7}{desc}", font=mono, fill=FG)
         if summary:
             y += lh * 1.5
-            d.text((48, y), "10 passed, 0 failed", font=mono, fill=GREEN)
+            d.text((48, y), f"{len(CHECKS)} passed, 0 failed", font=mono, fill=GREEN)
         d.text((W - 36, H - 34), "illustrative output", font=font(11, True), fill=DIM, anchor="rm")
         return img
 

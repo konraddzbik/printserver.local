@@ -1,37 +1,42 @@
 #!/usr/bin/env bash
-# Idempotent provisioning of a Raspberry Pi AirPrint server (CUPS + Avahi + brlaser).
-# Safe to re-run: every step checks state before changing it.
+# Provision a Raspberry Pi AirPrint server (CUPS + Avahi + brlaser).
+# Converges to the configured state and is safe to re-run: settings, the queue
+# and services are only touched when they differ from what's configured.
 #
-# Usage (on the Pi):  sudo ./scripts/setup.sh [--dry-run]
+# Usage (on the Pi):  sudo ./scripts/setup.sh [--dry-run] [--force]
+#   --dry-run  print what would change, change nothing
+#   --force    recreate an existing queue (resets its driver options)
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/../config/printserver.env}"
-# shellcheck source=/dev/null
-[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-PRINTER_NAME="${PRINTER_NAME:-Brother}"
-DEVICE_URI="${DEVICE_URI:-}"
-PRINTER_MODEL="${PRINTER_MODEL:-auto}"
-PAPER_SIZE="${PAPER_SIZE:-A4}"
-NETWORK_ACCESS="${NETWORK_ACCESS:-local}"
-DRY_RUN=0
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+usage() { printf 'usage: %s [--dry-run] [--force]\n' "$0"; }
+DRY_RUN=0 FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --force)   FORCE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *)         usage >&2; die "unknown argument: $arg" ;;
+  esac
+done
 
-log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m  ✗\033[0m %s\n' "$*" >&2; exit 1; }
-run()  { if (( DRY_RUN )); then printf '    [dry-run] %s\n' "$*"; else "$@"; fi; }
-
-[[ "$PRINTER_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || die "PRINTER_NAME '$PRINTER_NAME' must not contain spaces, '/' or '#'"
-[[ "$NETWORK_ACCESS" =~ ^(local|any)$ ]] || die "NETWORK_ACCESS must be 'local' or 'any'"
+load_config
 (( DRY_RUN )) || [[ $EUID -eq 0 ]] || die "run as root: sudo $0"
 
+CHANGED=0
+run() { if (( DRY_RUN )); then printf '    [dry-run] %s\n' "$*"; else "$@"; fi; CHANGED=1; }
+have() { command -v "$1" >/dev/null; }
+
 # 1. Packages ---------------------------------------------------------------
-log "Installing packages"
-PKGS=(cups avahi-daemon avahi-utils printer-driver-brlaser)
+log "Packages"
+PKGS=(cups avahi-daemon avahi-utils printer-driver-brlaser curl)   # curl: verify.sh DOD-4
 missing=()
-for p in "${PKGS[@]}"; do dpkg -s "$p" &>/dev/null || missing+=("$p"); done
+for p in "${PKGS[@]}"; do
+  # dpkg -s also succeeds for removed-but-not-purged ("rc") packages
+  [[ "$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null)" == installed ]] || missing+=("$p")
+done
 if (( ${#missing[@]} )); then
   run apt-get update
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
@@ -44,46 +49,86 @@ if [[ -n "$ADMIN_USER" && "$ADMIN_USER" != root ]] && ! id -nG "$ADMIN_USER" | g
   run usermod -aG lpadmin "$ADMIN_USER"
 fi
 
-run systemctl enable --now cups avahi-daemon
+for svc in cups avahi-daemon; do
+  if ! systemctl is-enabled --quiet "$svc" 2>/dev/null || ! systemctl is-active --quiet "$svc"; then
+    run systemctl enable --now "$svc"
+  fi
+done
 
-# 2. Network exposure — one cupsctl call, separate calls can reset earlier flags
-log "Opening CUPS to the network ($NETWORK_ACCESS)"
-if [[ "$NETWORK_ACCESS" == any ]]; then
-  run cupsctl --remote-any --remote-admin --share-printers WebInterface=yes
+# 2. Server settings: a single cupsctl call, only when something differs --------
+log "Server settings (network: $NETWORK_ACCESS, remote admin: $REMOTE_ADMIN)"
+want=(_share_printers=1 WebInterface=Yes "PreserveJobHistory=$JOB_HISTORY_SECONDS")
+flags=(--share-printers WebInterface=Yes "PreserveJobHistory=$JOB_HISTORY_SECONDS")
+if [[ $NETWORK_ACCESS == any ]]; then want+=(_remote_any=1); flags+=(--remote-any)
+else                                  want+=(_remote_any=0); flags+=(--no-remote-any); fi
+if [[ $REMOTE_ADMIN == yes ]]; then   want+=(_remote_admin=1); flags+=(--remote-admin)
+else                                  want+=(_remote_admin=0); flags+=(--no-remote-admin); fi
+
+current="$(have cupsctl && cupsctl 2>/dev/null || true)"
+drift=0
+for kv in "${want[@]}"; do grep -qixF "$kv" <<<"$current" || drift=1; done
+if (( drift )); then
+  run cupsctl "${flags[@]}"   # cupsd restarts itself to apply the new cupsd.conf
 else
-  run cupsctl --no-remote-any --remote-admin --share-printers WebInterface=yes
+  ok "settings already match"
 fi
-run systemctl restart cups
 
 # 3. Printer queue ----------------------------------------------------------
-log "Configuring queue '$PRINTER_NAME'"
+log "Queue '$PRINTER_NAME'"
+DRY_PLACEHOLDER=0
 if [[ -z "$DEVICE_URI" ]]; then
-  DEVICE_URI="$(lpinfo -v 2>/dev/null | awk '$2 ~ /^usb:\/\// {print $2; exit}')" || true
-  [[ -n "$DEVICE_URI" ]] || die "no USB printer found by 'lpinfo -v' — is it powered on? check 'lsusb'"
-  ok "detected $DEVICE_URI"
+  if ! have lpinfo; then
+    (( DRY_RUN )) || die "lpinfo not found: CUPS install failed?"
+    printf '    [dry-run] would auto-detect the USB printer with lpinfo -v once CUPS is installed\n'
+    DEVICE_URI="usb://<detected>" DRY_PLACEHOLDER=1
+  else
+    mapfile -t usb < <(lpinfo -v 2>/dev/null | awk '$2 ~ /^usb:\/\// {print $2}')
+    (( ${#usb[@]} )) || die "no USB printer found by 'lpinfo -v'. Is it powered on? Check 'lsusb'."
+    (( ${#usb[@]} == 1 )) || die "several USB printers found; set DEVICE_URI to one of: ${usb[*]}"
+    DEVICE_URI="${usb[0]}"
+    ok "detected $DEVICE_URI"
+  fi
 fi
 
 if [[ "$PRINTER_MODEL" == auto ]]; then
-  if [[ "$DEVICE_URI" =~ ^(ipp|ipps):// ]]; then
-    PRINTER_MODEL=everywhere
-  else
-    # Match the model from the URI (e.g. "HL-1110") against available brlaser PPDs.
-    model_hint="$(sed -E 's#^usb://[^/]+/([^?]+).*#\1#; s#%20# #g; s# series##' <<<"$DEVICE_URI")"
-    PRINTER_MODEL="$(lpinfo -m 2>/dev/null | grep -i brlaser | grep -iF "$model_hint" | awk '{print $1; exit}')" || true
-    [[ -n "$PRINTER_MODEL" ]] || die "no brlaser PPD matches '$model_hint' — set PRINTER_MODEL explicitly (lpinfo -m | grep -i brlaser)"
-  fi
+  case "$DEVICE_URI" in
+    ipp://*|ipps://*|dnssd://*) PRINTER_MODEL=everywhere ;;
+    usb://*)
+      if (( DRY_PLACEHOLDER )) || ! have lpinfo; then
+        (( DRY_RUN )) || die "lpinfo not found: CUPS install failed?"
+        PRINTER_MODEL="<brlaser PPD matching the printer>"
+      else
+        # Match the model in the URI (e.g. "HL-1110") against the available brlaser PPDs.
+        model_hint="$(sed -E 's#^usb://[^/]+/([^?]+).*#\1#; s#%20# #g; s# series$##' <<<"$DEVICE_URI")"
+        PRINTER_MODEL="$(lpinfo -m 2>/dev/null | grep -i brlaser | grep -iF -- "$model_hint" | awk '{print $1; exit}')" || true
+        [[ -n "$PRINTER_MODEL" ]] || die "no brlaser PPD matches '$model_hint'. Set PRINTER_MODEL (see: lpinfo -m | grep -i brlaser)."
+      fi ;;
+    *) die "can't pick a driver for '$DEVICE_URI'. Set PRINTER_MODEL explicitly." ;;
+  esac
   ok "model $PRINTER_MODEL"
 fi
 
-run lpadmin -p "$PRINTER_NAME" -E -v "$DEVICE_URI" -m "$PRINTER_MODEL" \
-  -o printer-is-shared=true -o media="$PAPER_SIZE"
-run lpadmin -d "$PRINTER_NAME"
-run cupsenable "$PRINTER_NAME"
-run cupsaccept "$PRINTER_NAME"
+existing_uri="$(have lpstat && lpstat -v "$PRINTER_NAME" 2>/dev/null | awk '{print $NF}' || true)"
+if [[ -z "$existing_uri" || $FORCE == 1 ]]; then
+  run lpadmin -p "$PRINTER_NAME" -E -v "$DEVICE_URI" -m "$PRINTER_MODEL" \
+    -o printer-is-shared=true -o media="$PAPER_SIZE"
+elif [[ "$existing_uri" != "$DEVICE_URI" ]]; then
+  die "queue '$PRINTER_NAME' already points at $existing_uri. Re-run with --force to replace it (resets its driver options)."
+else
+  ok "queue exists, keeping its driver options (use --force to recreate)"
+  lpoptions -p "$PRINTER_NAME" | grep -q 'printer-is-shared=true' \
+    || run lpadmin -p "$PRINTER_NAME" -o printer-is-shared=true
+  lpstat -p "$PRINTER_NAME" | grep -q 'enabled since' || run cupsenable "$PRINTER_NAME"
+  lpstat -a "$PRINTER_NAME" | awk -v p="$PRINTER_NAME" '$1==p && $2=="accepting" {f=1} END{exit !f}' \
+    || run cupsaccept "$PRINTER_NAME"
+fi
+[[ "$(have lpstat && lpstat -d 2>/dev/null)" == *": $PRINTER_NAME" ]] || run lpadmin -d "$PRINTER_NAME"
 
-# 4. Hygiene ------------------------------------------------------------------
-log "Housekeeping"
-run cupsctl PreserveJobHistory=no
-run systemctl restart avahi-daemon
+# 4. Re-announce over Bonjour only if something changed ------------------------
+if (( CHANGED && ! DRY_RUN )); then
+  systemctl restart avahi-daemon
+fi
 
-log "Done. Next: ./scripts/verify.sh"
+if (( DRY_RUN )); then log "Dry run complete: nothing was changed."
+elif (( CHANGED )); then log "Done. Next: ./scripts/verify.sh"
+else log "Already in the desired state, nothing changed."; fi

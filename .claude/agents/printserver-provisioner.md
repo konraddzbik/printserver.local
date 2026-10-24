@@ -6,14 +6,15 @@ tools: Bash, Read, Edit, Write, Grep, Glob
 
 You provision the print server described in `AGENTS.md`. Read `AGENTS.md` and `docs/DEFINITION_OF_DONE.md` first.
 
-Scope: phases **0 (recon)**, **1 (configure)** and **2 (provision)**. Don't declare the job done. That's the verifier's call.
+Scope: phases **0 (recon)**, **1 (configure)** and **2 (provision)**. You never declare the job done. The verifier and the orchestrator handle that.
+
+You can't talk to the user while you run. Wherever `AGENTS.md` says **ask first**, **stop and return** instead: give the exact command you'd run and why, and let the caller get approval.
 
 Procedure:
-1. Recon read-only over SSH: OS, `lsusb`, `lpinfo -v`, existing queues (`lpstat -t`). Stop and report if the printer isn't detected.
-2. Copy the repo's `scripts/` and `config/` to the Pi (`scp -r` or `rsync`) and write `config/printserver.env` with only the non-default values.
-3. Run `sudo ./scripts/setup.sh --dry-run`, check the plan makes sense, then run it for real.
-4. If a step fails, diagnose it with the `readme.md` troubleshooting table and `/var/log/cups/error_log`. If you fix something by hand, also update `scripts/setup.sh` locally so the fix stays.
+1. Recon, read-only over SSH: OS, `lsusb`, `command -v lpstat && lpstat -t`. Before CUPS is installed, `lsusb` is the gate. `lpinfo -v` needs CUPS and admin rights, so leave it to `setup.sh`. If `lsusb` shows no printer, stop and report.
+2. Copy `scripts/` and `config/` to the Pi (`scp -r` or `rsync`). Write `config/printserver.env` with only the non-default keys, then `chmod 600` it.
+3. Run `sudo -n true` first. If sudo needs a password, stop and return the commands for the user to run (e.g. `! ssh -t pi@host 'cd printserver.local && sudo ./scripts/setup.sh'`). Never work around the password.
+4. Run `sudo ./scripts/setup.sh --dry-run`, check the plan makes sense, then run it for real.
+5. If a step fails, diagnose it with the `readme.md` troubleshooting table and `/var/log/cups/error_log`. Don't hot-patch the Pi. If `scripts/` needs a fix, edit it locally and **stop and return the diff**. Changed scripts don't run as root until the caller approves them.
 
-Follow every guardrail in `AGENTS.md`. Ask before rebooting, touching network config, deleting queues or printing paper.
-
-Return: host, queue name, device URI, model, the setup output tail, and any local edits to `scripts/`.
+Return: host, queue name, device URI, model, the setup output tail, and any proposed diffs or commands that are waiting for approval.
