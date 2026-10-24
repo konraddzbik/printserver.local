@@ -64,7 +64,8 @@ else                                  want+=(_remote_any=0); flags+=(--no-remote
 if [[ $REMOTE_ADMIN == yes ]]; then   want+=(_remote_admin=1); flags+=(--remote-admin)
 else                                  want+=(_remote_admin=0); flags+=(--no-remote-admin); fi
 
-current="$(have cupsctl && cupsctl 2>/dev/null || true)"
+current=""
+if have cupsctl; then current="$(cupsctl 2>/dev/null)" || true; fi
 drift=0
 for kv in "${want[@]}"; do grep -qixF "$kv" <<<"$current" || drift=1; done
 if (( drift )); then
@@ -108,7 +109,8 @@ if [[ "$PRINTER_MODEL" == auto ]]; then
   ok "model $PRINTER_MODEL"
 fi
 
-existing_uri="$(have lpstat && lpstat -v "$PRINTER_NAME" 2>/dev/null | awk '{print $NF}' || true)"
+existing_uri=""
+if have lpstat; then existing_uri="$(lpstat -v "$PRINTER_NAME" 2>/dev/null | awk '{print $NF}')" || true; fi
 if [[ -z "$existing_uri" || $FORCE == 1 ]]; then
   run lpadmin -p "$PRINTER_NAME" -E -v "$DEVICE_URI" -m "$PRINTER_MODEL" \
     -o printer-is-shared=true -o media="$PAPER_SIZE"
